@@ -1,0 +1,722 @@
+---
+title: "Quantifying the Blast Radius: Centrality-Based Criticality Modeling for Infrastructure Risk"
+subtitle: "A Structural Risk Case Study — NexaCore Financial Technologies"
+author: "Patrick Lefler"
+abstract: |
+  Centrality scores are easy to compute and easy to misread. A node with high betweenness
+  centrality is mathematically a chokepoint, but without a topology specific enough to make
+  that chokepoint legible, the finding remains abstract. This project builds a 90-node
+  synthetic infrastructure topology for a fintech estate and applies three independent
+  centrality measures -- betweenness, eigenvector, and PageRank -- to identify structurally
+  critical nodes, then validates each candidate through direct node-removal simulation rather
+  than relying on the centrality score alone. The three metrics are deliberately compared
+  rather than averaged: where they agree, the finding is robust; where they diverge, the
+  divergence itself indicates that a node is critical for different structural reasons. A
+  business impact layer maps each node to estimated revenue exposure and customer-facing
+  consequence, converting a graph-theoretic ranking into a board-legible prioritization. The
+  analysis surfaces an authentication gateway with no redundant path serving as a structural
+  single point of failure for the majority of revenue-generating traffic -- a finding
+  invisible to conventional infrastructure inventories but immediate once the dependency
+  graph is traversed.
+date: "YYYY-MM-DD"
+format:
+  html:
+    code-fold: true
+    code-copy: true
+    code-overflow: wrap
+    code-tools: false
+    code-summary: "Display code"
+    df-print: kable
+    embed-math: true
+    embed-resources: true
+    fig-align: center
+    fig-height: 6
+    fig-width: 10
+    highlight-style: arrow
+    lightbox: true
+    linkcolor: "#0166CC"
+    number-sections: false
+    page-layout: full
+    smooth-scroll: true
+    theme: sandstone
+    toc: true
+    toc-depth: 3
+    toc-location: right
+    toc-title: "Contents"
+execute:
+  echo: true
+  warning: false
+  message: false
+html-math-method: mathjax
+knitr:
+  opts_chunk:
+    comment: "#>"
+---
+
+```{r setup}
+#| label: setup
+#| include: false
+
+# -- Libraries ----------------------------------------------------------------
+library(kableExtra)   # Table formatting
+library(knitr)        # Document rendering
+library(plotly)       # Interactive chart wrapping
+library(scales)       # Axis and label formatting
+library(sessioninfo)  # Session provenance
+library(tidyverse)    # Data manipulation and ggplot2
+library(igraph)       # Graph construction and layout
+library(tidygraph)    # Tidy API for igraph objects
+library(ggraph)       # Graph visualization
+library(ggrepel)      # Non-overlapping text labels on scatter plots
+library(DT)           # Interactive datatable for full centrality exploration
+
+# -- Brand palette ------------------------------------------------------------
+brand_primary   <- "#1A1A2E"
+brand_secondary <- "#16213E"
+brand_accent    <- "#0F3460"
+brand_highlight <- "#E94560"
+brand_surface   <- "#F5F5F5"
+brand_text      <- "#1A1A2E"
+
+brand_palette <- c(
+  primary   = brand_primary,
+  secondary = brand_secondary,
+  accent    = brand_accent,
+  highlight = brand_highlight
+)
+
+tier_colors <- c(
+  "Edge / Perimeter"      = "#4A90D9",
+  "Application / Service" = brand_secondary,
+  "Data"                  = brand_accent,
+  "Infrastructure"        = "#8899AA",
+  "External Dependency"   = "#E8A838",
+  "Core Business Systems" = brand_highlight,
+  "Monitoring / Ops"      = "#4C7A6B"
+)
+
+metric_colors <- c(
+  "Betweenness" = brand_accent,
+  "Eigenvector" = brand_secondary,
+  "PageRank"    = brand_highlight
+)
+
+# -- ggplot2 theme ------------------------------------------------------------
+theme_nexacore <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      text             = element_text(color = brand_text),
+      plot.title       = element_text(face = "bold", size = base_size + 2,
+                                      color = brand_primary, margin = margin(b = 6)),
+      plot.subtitle    = element_text(size = base_size - 1, color = "#555555",
+                                      margin = margin(b = 10)),
+      plot.caption     = element_text(size = base_size - 3, color = "#888888",
+                                      hjust = 0, margin = margin(t = 8)),
+      axis.title       = element_text(size = base_size - 1, color = "#444444"),
+      axis.text        = element_text(size = base_size - 2, color = "#555555"),
+      panel.grid.major = element_line(color = "#EEEEEE", linewidth = 0.4),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background  = element_rect(fill = "white", color = NA),
+      legend.position  = "bottom",
+      legend.title     = element_text(size = base_size - 2, face = "bold"),
+      legend.text      = element_text(size = base_size - 2),
+      strip.text       = element_text(face = "bold", size = base_size - 1)
+    )
+}
+
+theme_set(theme_nexacore())
+
+# -- Data ingestion -----------------------------------------------------------
+nodes         <- read_csv("data/nodes.csv",            show_col_types = FALSE)
+edges         <- read_csv("data/edges.csv",            show_col_types = FALSE)
+centrality    <- read_csv("data/centrality_scores.csv",show_col_types = FALSE)
+blast_results <- read_csv("data/blast_radius.csv",     show_col_types = FALSE)
+```
+
+## Introduction
+
+Infrastructure risk assessments typically produce a list: servers, services, databases ranked by tier, by criticality label, by compliance classification. What they rarely produce is an answer to the question that matters most in an incident — *if this one thing fails, how much of the business breaks with it?* The list format cannot answer that question. Dependencies are transitive. A database that two services read directly is depended on by every service that depends on those two services. A shared authentication gateway that appears in no formal risk register may sit on every path between a customer and their account.
+
+Graph theory is the right framework for this class of problem. When infrastructure is modeled as a directed dependency graph, the question "what breaks if X fails" becomes a graph computation: remove node X and measure how many previously reachable node pairs are now disconnected. The answer is precise, reproducible, and independent of whatever labels were applied to X in the last risk register update.
+
+This case study applies that framework to NexaCore Financial Technologies' infrastructure estate. The topology is synthetic but designed to reflect the structural patterns of a real fintech operation: a few highly-connected data stores, a small number of cross-cutting services that every authenticated transaction passes through, a set of external dependencies with no fallback path, and a long tail of single-purpose nodes that exist in the graph but carry limited systemic weight. Three centrality metrics -- betweenness, eigenvector, and PageRank -- are computed independently and compared rather than averaged. Where they agree, the finding is structurally robust. Where they diverge, the divergence is itself informative: a node can be critical for different structural reasons, and those reasons drive different remediation responses.
+
+The analysis is paired with direct blast radius simulation. Centrality metrics are computed from graph topology alone; they do not account for the business weight of what a node enables. Blast radius simulation fills that gap. One node in this topology -- a third-party KYC/AML vendor -- ranks 74th by composite centrality and 52nd by blast radius. Its removal breaks nine reachable pairs in the full graph. Three of those pairs involve the client onboarding workflow, the compliance reporting engine, and real-time fraud screening. Centrality would deprioritize it. Operational context cannot.
+
+## Centrality as a Risk Metric
+
+Infrastructure risk practitioners have long used ad-hoc notions of criticality -- "this is a Tier 1 system" -- without a systematic method for deriving those tiers from structure rather than assertion. Graph centrality provides that method. Three measures are relevant here, each answering a different structural question.
+
+**Betweenness centrality** counts how often a node appears on the shortest path between every other pair of nodes in the graph. A node with high betweenness is a chokepoint: traffic, data, and control flow converge through it. In an infrastructure dependency graph, high betweenness indicates that many workflows pass *through* this node rather than terminating at it. The authentication gateway is a canonical example -- it stores nothing, but every authenticated request to every downstream service is routed through it.
+
+**Eigenvector centrality** measures influence by the quality of a node's connections, not just their quantity. A node connected to many high-centrality nodes scores highly even if its raw degree is modest. In a dependency graph, high eigenvector centrality indicates that a node sits in the structural center of the most well-connected part of the estate -- surrounded by other high-value nodes that themselves have many dependents. Core data stores tend to dominate this metric, because the services that read them are themselves highly connected.
+
+**PageRank** follows the same intuition as eigenvector centrality but uses a random-walk formulation that handles directed graphs more cleanly. In the directed dependency graph used here, edges point from dependents to dependencies (A depends on B means A -\> B). PageRank accumulates at nodes with many incoming edges from high-PageRank sources -- nodes that are depended upon by other well-depended-upon nodes. The Secrets Vault is a characteristic example: every service depends on it for database credentials, and those services are themselves critical.
+
+Using three metrics rather than one is not hedging -- it is the analysis. A node that ranks in the top tier on all three measures is unambiguously critical regardless of framing. A node that ranks highly on betweenness alone but not on PageRank or eigenvector is a pass-through chokepoint rather than a foundational data dependency, which points to a different remediation (add redundant routing versus add read replicas). A node that scores low on all three but produces high blast radius in simulation is the most operationally dangerous type: invisible to centrality analysis, material in practice.
+
+## The Infrastructure Topology
+
+NexaCore's synthetic estate spans 90 nodes across seven tiers, connected by 155 directed dependency edges. The topology was designed from structural principles rather than node count: fan-out ratios, redundancy patterns, and the placement of six deliberate structural risks were specified before any node was added.
+
+```{r topology-overview}
+#| label: topology-overview
+
+tier_summary <- nodes |>
+  count(tier, name = "node_count") |>
+  left_join(
+    edges |>
+      left_join(nodes |> select(id, tier), by = c("from" = "id")) |>
+      count(tier, name = "outbound_edges"),
+    by = "tier"
+  ) |>
+  mutate(
+    spof_count     = map_int(tier, ~sum(nodes$spof == "True" & nodes$tier == .x)),
+    risk_count     = map_int(tier, ~sum(nodes$risk_node == "True" & nodes$tier == .x)),
+    outbound_edges = replace_na(outbound_edges, 0L)
+  ) |>
+  arrange(match(tier, names(tier_colors)))
+
+kable(
+  tier_summary,
+  format    = "html",
+  caption   = "Table 1: Topology Inventory by Tier",
+  col.names = c("Tier", "Nodes", "Outbound Edges", "SPOFs", "Risk Nodes")
+) |>
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = TRUE,
+    position          = "left",
+    font_size         = 13
+  )
+```
+
+```{r tier-viz}
+#| label: tier-viz
+#| fig-cap: "Figure 1: Node distribution across tiers. Application / Service and Data tiers account for the majority of the topology; the long tail of lower-degree nodes in those tiers creates the sparsity that makes high-centrality nodes stand out."
+
+nodes |>
+  count(tier) |>
+  mutate(tier = fct_reorder(tier, n)) |>
+  ggplot(aes(x = n, y = tier, fill = tier)) +
+  geom_col(width = 0.65, show.legend = FALSE) +
+  geom_text(aes(label = n), hjust = -0.3, size = 3.5, color = brand_text) +
+  scale_fill_manual(values = tier_colors) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title   = "Node Count by Tier",
+    x       = "Number of nodes",
+    y       = NULL,
+    caption = "90 nodes total across 7 tiers."
+  )
+```
+
+```{r degree-distribution}
+#| label: degree-distribution
+#| fig-cap: "Figure 2: In-degree distribution (number of nodes that depend on each node). The long tail of low-degree nodes and the small number of high-degree hubs are the structural signature that makes centrality analysis meaningful. Most nodes have 0--2 dependents; a handful have 10 or more."
+
+in_deg <- edges |>
+  count(to, name = "in_degree") |>
+  right_join(nodes |> select(id, tier), by = c("to" = "id")) |>
+  mutate(in_degree = replace_na(in_degree, 0L))
+
+in_deg |>
+  ggplot(aes(x = in_degree, fill = tier)) +
+  geom_histogram(binwidth = 1, color = "white", linewidth = 0.3) +
+  scale_fill_manual(values = tier_colors, name = "Tier") +
+  scale_x_continuous(breaks = seq(0, 20, 2)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title   = "In-Degree Distribution",
+    x       = "Number of nodes that depend on this node (in-degree)",
+    y       = "Count",
+    caption = "In-degree = number of direct upstream dependents. Computed from edges.csv."
+  )
+```
+
+The degree distribution confirms the design intent: roughly 60% of nodes have in-degree of zero or one (they depend on others but few depend on them). The nodes with in-degree of 10 or higher -- the right tail of Figure 2 -- are the candidates the centrality analysis will examine in detail.
+
+## Graph Construction
+
+```{r graph-construction}
+#| label: graph-construction
+
+# Build igraph object from nodes and edges CSVs
+node_tbl <- nodes |>
+  transmute(
+    name      = id,
+    label     = name,
+    tier      = tier,
+    rev_wt    = as.integer(revenue_weight),
+    spof      = spof == "True",
+    risk_node = risk_node == "True",
+    cust_face = customer_facing == "True"
+  )
+
+edge_tbl <- edges |>
+  transmute(from = from, to = to)
+
+g <- graph_from_data_frame(d = edge_tbl, directed = TRUE, vertices = node_tbl)
+
+# Join pre-computed centrality scores onto vertex attributes
+cent_join <- centrality |>
+  select(node_id, betweenness_norm, pagerank_norm,
+         eigenvector_norm, composite_score, blast_radius, blast_norm)
+
+V(g)$bw_norm   <- cent_join$betweenness_norm[match(V(g)$name, cent_join$node_id)]
+V(g)$pr_norm   <- cent_join$pagerank_norm[match(V(g)$name, cent_join$node_id)]
+V(g)$ev_norm   <- cent_join$eigenvector_norm[match(V(g)$name, cent_join$node_id)]
+V(g)$composite <- cent_join$composite_score[match(V(g)$name, cent_join$node_id)]
+V(g)$blast     <- cent_join$blast_radius[match(V(g)$name, cent_join$node_id)]
+
+graph_stats <- tibble(
+  Metric = c(
+    "Total nodes",
+    "Total directed edges",
+    "Graph density",
+    "Weakly connected components",
+    "Nodes flagged as SPOF",
+    "Designated risk nodes",
+    "Nodes with in-degree >= 10"
+  ),
+  Value = c(
+    vcount(g),
+    ecount(g),
+    round(graph.density(g), 4),
+    components(g, mode = "weak")$no,
+    sum(V(g)$spof),
+    sum(V(g)$risk_node),
+    sum(degree(g, mode = "in") >= 10)
+  )
+)
+
+kable(
+  graph_stats,
+  format    = "html",
+  caption   = "Table 2: Dependency Graph Summary Statistics",
+  col.names = c("Metric", "Value")
+) |>
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    position          = "left",
+    font_size         = 13
+  )
+```
+
+The graph density of `r round(graph.density(g), 4)` confirms the intended sparsity: fewer than 2% of all possible directed edges exist. This is consistent with real enterprise topologies where each service depends on a small number of immediate dependencies rather than being globally connected. The sparsity is what makes high-centrality nodes analytically significant -- they stand out against a background of low-connectivity nodes.
+
+```{r full-topology-viz}
+#| label: full-topology-viz
+#| fig-cap: "Figure 3: Full dependency graph, nodes sized by composite centrality score. The Authentication Gateway, Secrets Vault, and Shared Message Queue are visually dominant. Risk nodes are outlined in red. The majority of nodes cluster at small sizes, confirming the long-tail degree distribution."
+#| fig-height: 9
+
+tg <- as_tbl_graph(g) |>
+  mutate(
+    node_size  = 2 + composite * 14,
+    node_alpha = 0.5 + composite * 0.5,
+    outline    = if_else(risk_node, brand_highlight, "white")
+  )
+
+set.seed(42)
+ggraph(tg, layout = "fr") +
+  geom_edge_link(
+    alpha = 0.15, color = "#999999",
+    arrow = arrow(length = unit(2, "mm"), type = "closed"),
+    end_cap = circle(2.5, "mm")
+  ) +
+  geom_node_point(
+    aes(fill = tier, size = node_size, alpha = node_alpha, color = outline),
+    shape = 21, stroke = 0.8
+  ) +
+  scale_fill_manual(values = tier_colors, name = "Tier") +
+  scale_color_identity() +
+  scale_size_identity() +
+  scale_alpha_identity() +
+  geom_node_text(
+    aes(label = if_else(composite > 0.12, label, "")),
+    size = 2.6, repel = TRUE, color = brand_text,
+    max.overlaps = 25
+  ) +
+  labs(
+    title    = "NexaCore Infrastructure Dependency Graph",
+    subtitle = "Node size proportional to composite centrality score. Risk nodes outlined in red.",
+    caption  = "Layout: Fruchterman-Reingold force-directed. 90 nodes, 155 directed edges."
+  ) +
+  theme_graph(base_family = "sans") +
+  theme(
+    plot.title    = element_text(face = "bold", size = 13, color = brand_primary),
+    plot.subtitle = element_text(size = 10, color = "#555555"),
+    plot.caption  = element_text(size = 8, color = "#888888"),
+    legend.position = "bottom"
+  )
+```
+
+## Centrality Analysis
+
+All three centrality metrics were pre-computed on the full dependency graph and are read directly from `data/centrality_scores.csv`. The interactive table below allows sorting by any individual metric; the analysis that follows focuses on where the rankings agree and where they diverge.
+
+```{r centrality-table}
+#| label: centrality-table
+
+cent_display <- centrality |>
+  arrange(desc(composite_score)) |>
+  select(name, tier, betweenness_norm, pagerank_norm,
+         eigenvector_norm, composite_score, blast_radius) |>
+  mutate(across(c(betweenness_norm, pagerank_norm,
+                  eigenvector_norm, composite_score), ~round(.x, 3)))
+
+DT::datatable(
+  cent_display,
+  colnames  = c("Node", "Tier", "Betweenness", "PageRank",
+                "Eigenvector", "Composite", "Blast Radius"),
+  caption   = "Table 3: Full Centrality Rankings (sortable). All centrality scores normalized to [0, 1].",
+  options   = list(
+    pageLength = 15,
+    order      = list(list(5, "desc")),
+    scrollX    = TRUE
+  ),
+  rownames  = FALSE,
+  class     = "stripe hover compact"
+)
+```
+
+```{r centrality-top15}
+#| label: centrality-top15
+#| fig-cap: "Figure 4: Top 15 nodes by composite centrality score, broken out by individual metric. Nodes where all three bars are tall are structurally critical by every measure. Nodes with one dominant bar are critical for a specific structural reason -- which drives the remediation approach."
+#| fig-height: 7
+
+top15 <- centrality |>
+  slice_head(n = 15) |>
+  select(name, betweenness_norm, pagerank_norm, eigenvector_norm) |>
+  pivot_longer(
+    cols      = c(betweenness_norm, pagerank_norm, eigenvector_norm),
+    names_to  = "metric",
+    values_to = "score"
+  ) |>
+  mutate(
+    metric = recode(metric,
+      betweenness_norm = "Betweenness",
+      pagerank_norm    = "PageRank",
+      eigenvector_norm = "Eigenvector"
+    ),
+    name = fct_reorder(name, score, .fun = sum)
+  )
+
+ggplot(top15, aes(x = score, y = name, fill = metric)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_fill_manual(values = metric_colors, name = "Metric") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05)),
+                     labels = scales::number_format(accuracy = 0.01)) +
+  labs(
+    title    = "Top 15 Nodes: Centrality Score by Metric",
+    subtitle = "Divergence between metrics indicates different structural risk profiles",
+    x        = "Normalized score [0, 1]",
+    y        = NULL,
+    caption  = "Scores normalized independently per metric. Composite = mean of three."
+  )
+```
+
+The divergence pattern in Figure 4 is the analysis's primary finding. `secrets-vault` leads on both PageRank and eigenvector but has near-zero betweenness -- it is a deep dependency that everything ultimately relies on, but it is not a pass-through node on any workflow's critical path. `auth-gateway` shows the opposite pattern: near-perfect betweenness with modest PageRank and eigenvector -- it is the routing chokepoint for authenticated traffic, but it stores nothing that other nodes depend on for data. `message-queue` scores highly on all three, making it the topology's most consistently critical node by graph structure alone.
+
+The divergence between `secrets-vault` and `auth-gateway` is not an analytical ambiguity -- it is a finding. Remediating `auth-gateway` means adding a redundant routing path so that authentication is no longer a single-lane bottleneck. Remediating `secrets-vault` means introducing a secondary vault instance or a local credential cache so that vault unavailability does not simultaneously revoke every service's database access. The metrics agree that both are critical; they disagree in exactly the way that forces the right remediation conversation.
+
+```{r centrality-scatter}
+#| label: centrality-scatter
+#| fig-cap: "Figure 5: Betweenness vs. PageRank for all 90 nodes on log1p-transformed axes, sized by eigenvector centrality. Log transformation separates the dense cluster near the origin without excluding zero values. Nodes on the horizontal axis (high PageRank, low betweenness) are foundational data dependencies; nodes on the vertical axis are routing chokepoints."
+
+centrality |>
+  mutate(
+    risk_label = if_else(risk_node == "True", name, ""),
+    point_size = 2 + eigenvector_norm * 8,
+    # log1p transformation spreads the origin cluster while preserving zeros
+    pr_log  = log1p(pagerank_norm * 100),
+    bw_log  = log1p(betweenness_norm * 100)
+  ) |>
+  ggplot(aes(x = pr_log, y = bw_log, size = point_size, fill = tier)) +
+  geom_point(shape = 21, color = "white", stroke = 0.4, alpha = 0.85) +
+  ggrepel::geom_text_repel(
+    aes(label = risk_label),
+    size = 2.8, color = brand_text, max.overlaps = 20,
+    box.padding = 0.5, min.segment.length = 0.2
+  ) +
+  scale_fill_manual(values = tier_colors, name = "Tier") +
+  scale_size_identity() +
+  annotate("text", x = 4.4, y = 0.4,
+           label = "High PageRank\nLow betweenness\n(foundational dependency)",
+           size = 2.8, color = "#888888", hjust = 0.5) +
+  annotate("text", x = 0.4, y = 4.4,
+           label = "High betweenness\nLow PageRank\n(routing chokepoint)",
+           size = 2.8, color = "#888888", hjust = 0.5) +
+  labs(
+    title    = "Betweenness vs. PageRank",
+    subtitle = "Point size proportional to eigenvector centrality. Risk nodes labelled.",
+    x        = "PageRank -- log1p(score x 100)",
+    y        = "Betweenness -- log1p(score x 100)",
+    caption  = "Log1p transformation applied to spread origin cluster. Both axes: log1p(normalized score x 100)."
+  )
+```
+
+## Blast Radius Validation
+
+Centrality metrics are structural properties of the graph. They say nothing directly about the business consequence of a node's failure. Blast radius simulation fills that gap: for each node, remove it from the graph and count how many previously reachable node pairs are now disconnected. The result is a direct, simulation-derived measure of structural impact that does not depend on any assumptions about business weight.
+
+```{r blast-radius-table}
+#| label: blast-radius-table
+
+blast_top20 <- blast_results |>
+  arrange(desc(blast_radius)) |>
+  slice_head(n = 20) |>
+  select(name, tier, blast_radius, betweenness_norm,
+         pagerank_norm, eigenvector_norm, composite_score) |>
+  mutate(across(c(betweenness_norm, pagerank_norm,
+                  eigenvector_norm, composite_score), ~round(.x, 3)))
+
+kable(
+  blast_top20,
+  format    = "html",
+  caption   = "Table 4: Top 20 Nodes by Blast Radius (broken reachable pairs on node removal)",
+  col.names = c("Node", "Tier", "Blast Radius",
+                "Betweenness", "PageRank", "Eigenvector", "Composite")
+) |>
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = TRUE,
+    position          = "left",
+    font_size         = 13
+  )
+```
+
+```{r blast-viz}
+#| label: blast-viz
+#| fig-cap: "Figure 6: Blast radius for the top 20 nodes by broken reachable pairs. The Authentication Gateway's dominance (285 pairs) reflects its position as the sole authenticated-traffic routing point. The gap between auth-gateway and the second-ranked node (waf at 100) is itself a risk signal -- this is not a smooth distribution."
+
+blast_results |>
+  arrange(desc(blast_radius)) |>
+  slice_head(n = 20) |>
+  mutate(
+    node_label = fct_reorder(name, blast_radius),
+    is_risk    = risk_node == "True"
+  ) |>
+  ggplot(aes(x = blast_radius, y = node_label, fill = tier)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = blast_radius), hjust = -0.3,
+            size = 3.2, color = brand_text) +
+  scale_fill_manual(values = tier_colors, name = "Tier") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title    = "Blast Radius: Top 20 Nodes",
+    subtitle = "Broken reachable node pairs on node removal from the dependency graph",
+    x        = "Broken reachable pairs",
+    y        = NULL,
+    caption  = "Baseline: 566 reachable pairs across the 90-node topology."
+  )
+```
+
+```{r centrality-vs-blast}
+#| label: centrality-vs-blast
+#| fig-cap: "Figure 7: Composite centrality score vs. blast radius (log1p scale) for all 90 nodes. Log transformation separates the dense lower cluster without excluding low-blast nodes. The KYC/AML Vendor sits in the highlighted zone -- low composite centrality, non-trivial blast radius -- and would be deprioritized by a centrality-only framework."
+
+centrality |>
+  mutate(
+    blast_log  = log1p(blast_radius),
+    kyc_label  = if_else(node_id == "kyc-vendor", "KYC / AML Vendor\n(centrality rank 74, blast = 9)", ""),
+    high_label = if_else(composite_score > 0.25 & blast_radius > 40, name, ""),
+    label      = if_else(kyc_label != "", kyc_label, high_label)
+  ) |>
+  ggplot(aes(x = composite_score, y = blast_log, fill = tier)) +
+  geom_point(shape = 21, color = "white", stroke = 0.4, size = 3.5, alpha = 0.85) +
+  ggrepel::geom_text_repel(
+    aes(label = label),
+    size = 2.8, color = brand_text, max.overlaps = 15,
+    box.padding = 0.5, min.segment.length = 0.2
+  ) +
+  scale_fill_manual(values = tier_colors, name = "Tier") +
+  # Annotate the KYC counterexample zone (log1p(5)=1.79, log1p(15)=2.77)
+  annotate("rect", xmin = 0, xmax = 0.06, ymin = log1p(4), ymax = log1p(20),
+           fill = brand_highlight, alpha = 0.07) +
+  annotate("text", x = 0.03, y = log1p(25),
+           label = "Low centrality\nnon-trivial blast\n(centrality misses these)",
+           size = 2.6, color = brand_highlight, hjust = 0.5) +
+  scale_y_continuous(
+    breaks = log1p(c(0, 5, 10, 25, 50, 100, 200, 285)),
+    labels = c("0","5","10","25","50","100","200","285")
+  ) +
+  labs(
+    title    = "Composite Centrality vs. Blast Radius",
+    subtitle = "Nodes in the highlighted zone would be deprioritized by centrality alone",
+    x        = "Composite centrality score",
+    y        = "Blast radius (broken reachable pairs, log scale)",
+    caption  = "Y-axis: log1p transformation. Composite score = mean of normalized betweenness, PageRank, and eigenvector."
+  )
+```
+
+The KYC/AML Vendor sits in the annotated zone in Figure 7: composite centrality of 0.017 (74th of 90), blast radius of 9. On a linear scale that figure would have been buried in the origin cluster, invisible. The log transformation makes it readable -- and the position is the point. The pairs it breaks are specific: all paths from the client onboarding service, the compliance reporting engine, and the real-time fraud screening service to their downstream dependencies disappear when the vendor is removed. There is no fallback path. Onboarding stops. Compliance submissions fail. Fraud signals go dark. A centrality-only prioritization framework would not flag this node for remediation at all.
+
+## Business Impact Translation
+
+Structural blast radius measures connectivity loss. Business impact translates that into revenue and customer-facing consequence. Each node in the topology carries a `revenue_weight` attribute on a 1--5 scale reflecting its proximity to revenue-generating workflows. The composite criticality score used for remediation prioritization combines structural blast radius with this business weight.
+
+```{r business-impact}
+#| label: business-impact
+
+# Composite criticality = blast_norm * 0.6 + rev_wt_norm * 0.4
+# (blast radius is the primary driver; business weight is the tiebreaker)
+rev_max <- max(blast_results$revenue_weight)
+
+impact <- blast_results |>
+  filter(blast_radius > 0) |>
+  mutate(
+    rev_norm          = revenue_weight / rev_max,
+    criticality_score = round(blast_norm * 0.6 + rev_norm * 0.4, 3),
+    spof_flag         = spof == "True"
+  ) |>
+  arrange(desc(criticality_score)) |>
+  slice_head(n = 20)
+
+kable(
+  impact |> select(name, tier, blast_radius, revenue_weight, criticality_score, spof_flag),
+  format    = "html",
+  caption   = "Table 5: Top 20 Nodes by Composite Criticality Score (blast radius 60% + revenue weight 40%)",
+  col.names = c("Node", "Tier", "Blast Radius", "Revenue Weight", "Criticality Score", "SPOF")
+) |>
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = TRUE,
+    position          = "left",
+    font_size         = 13
+  )
+```
+
+```{r criticality-heatmap}
+#| label: criticality-heatmap
+#| fig-cap: "Figure 8: Blast radius (log scale) vs. revenue weight for nodes with blast radius > 0. Horizontal jitter separates nodes sharing the same integer revenue weight. Point size reflects composite criticality score. The Authentication Gateway occupies the top-right corner alone -- maximum blast radius, maximum revenue weight."
+
+set.seed(42)
+impact_full <- blast_results |>
+  filter(blast_radius > 0) |>
+  mutate(
+    rev_norm          = revenue_weight / max(revenue_weight),
+    criticality_score = blast_norm * 0.6 + rev_norm * 0.4,
+    blast_log         = log1p(blast_radius),
+    high_label        = if_else(criticality_score > 0.45, name, "")
+  )
+
+ggplot(impact_full,
+       aes(x = revenue_weight, y = blast_log,
+           size = criticality_score, fill = tier)) +
+  geom_point(
+    shape    = 21, color = "white", stroke = 0.4, alpha = 0.85,
+    position = position_jitter(width = 0.18, height = 0, seed = 42)
+  ) +
+  ggrepel::geom_text_repel(
+    aes(label = high_label, y = blast_log),
+    size = 2.8, color = brand_text, max.overlaps = 15,
+    box.padding = 0.5, min.segment.length = 0.2
+  ) +
+  scale_fill_manual(values = tier_colors, name = "Tier") +
+  scale_size_continuous(range = c(2, 10), name = "Criticality score") +
+  scale_x_continuous(breaks = 1:5,
+                     labels = c("1\n(low)","2","3","4","5\n(high)")) +
+  scale_y_continuous(
+    breaks = log1p(c(0, 5, 10, 25, 50, 100, 200, 285)),
+    labels = c("0","5","10","25","50","100","200","285")
+  ) +
+  labs(
+    title    = "Blast Radius vs. Revenue Weight",
+    subtitle = "Composite criticality combines structural exposure with business consequence",
+    x        = "Revenue weight (1 = low, 5 = high)",
+    y        = "Blast radius (broken reachable pairs, log scale)",
+    caption  = "Y-axis: log1p transformation. Horizontal jitter applied within each revenue weight band. Only nodes with blast radius > 0 shown."
+  )
+```
+
+## Remediation Prioritization
+
+The remediation backlog below is derived directly from the composite criticality ranking. Each entry includes the structural finding, the remediation type, and an effort classification. Remediation types are categorized as: **Add redundancy** (introduce a secondary path or failover), **Scope reduction** (reduce the blast radius by decoupling non-essential dependencies), or **External governance** (contractual and architectural controls for third-party nodes).
+
+```{r remediation}
+#| label: remediation
+
+remediation <- tribble(
+  ~priority, ~node,                    ~finding,
+  ~remediation_type,               ~effort,
+
+  1L, "Authentication Gateway",
+  "Sole authenticated-traffic path; removal breaks 285 pairs. No secondary route exists.",
+  "Add redundancy",                "High",
+
+  2L, "Web Application Firewall",
+  "All inbound traffic routes through a single WAF instance; 100 broken pairs on removal.",
+  "Add redundancy",                "Medium",
+
+  3L, "Secrets Vault",
+  "Every service-to-database credential passes through one vault; 55 broken pairs. Top PageRank and eigenvector.",
+  "Add redundancy",                "Medium",
+
+  4L, "Shared Message Queue",
+  "14 services publish/subscribe through one unpartitioned cluster; 51 broken pairs.",
+  "Scope reduction",               "High",
+
+  5L, "Core Financial Ledger",
+  "Single ledger service; 46 broken pairs. No read replica or secondary write path.",
+  "Add redundancy",                "High",
+
+  6L, "KYC / AML Vendor API",
+  "Low centrality (rank 74) but onboarding, compliance, and fraud all block on it with no fallback.",
+  "External governance",           "Medium",
+
+  7L, "Core Ledger Database",
+  "Single primary Postgres; 28 broken pairs. Relied on by ledger service and downstream consumers.",
+  "Add redundancy",                "High",
+
+  8L, "Legacy Billing Service",
+  "All payment reconciliation paths route through a pre-migration system; 18 broken pairs.",
+  "Scope reduction",               "High",
+
+  9L, "Primary Cache Cluster",
+  "Session state and rate-limit counters share one Redis cluster; 28 broken pairs.",
+  "Add redundancy",                "Low",
+
+  10L, "Production K8s Cluster",
+  "Primary container orchestration for all workloads; 45 broken pairs on removal.",
+  "Add redundancy",                "High"
+)
+
+kable(
+  remediation,
+  format    = "html",
+  caption   = "Table 6: Prioritized Remediation Backlog",
+  col.names = c("Priority", "Node", "Finding", "Remediation Type", "Effort")
+) |>
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = TRUE,
+    position          = "left",
+    font_size         = 13
+  )
+```
+
+Four of the ten items require high effort -- they are architectural changes (redundant auth routing, message queue partitioning, ledger service replication, legacy billing decoupling) rather than configuration changes. The remaining six are medium or low effort. The KYC/AML Vendor entry (rank 6) is the only item driven by blast radius simulation rather than centrality; without the simulation step, it would not appear in this list at all.
+
+## Key Insights & Conclusion
+
+The topology's most consequential structural risk is not its most prominent one. The Authentication Gateway produces the highest blast radius in the graph -- 285 broken reachable pairs, against a baseline of 566 -- which means a single-node failure would sever roughly half of all reachable paths in the estate. It also has the highest betweenness centrality by a wide margin. Neither of these facts appears in NexaCore's infrastructure inventory, because the inventory records what a system does, not where it sits in the dependency structure.
+
+The divergence between `secrets-vault` and `auth-gateway` illustrates why three metrics are more informative than one. Both nodes are unambiguously critical. They are critical in different ways: `auth-gateway` is a routing chokepoint that sits on every authenticated workflow's shortest path, while `secrets-vault` is a foundational dependency that every data-accessing service relies on transitively. Remediating `auth-gateway` requires a redundant authentication routing layer -- an active-active deployment behind the load balancers. Remediating `secrets-vault` requires a secondary vault instance with automatic unsealing, plus a local credential cache so that a brief vault outage does not simultaneously revoke every service's database access. These are different architectural decisions. A framework that averaged the three centrality scores into a single ranking and recommended "address the top N nodes" would obscure the distinction.
+
+The KYC/AML Vendor is the analysis's sharpest finding for a risk audience. It ranks 74th by composite centrality -- not because it is unimportant, but because it has few direct dependents and stores no data that others read. It is a leaf node in the graph. What centrality cannot see is that the three services depending on it -- onboarding, compliance reporting, and fraud screening -- each block synchronously on its availability, and none has a circuit breaker or cached fallback. The node-removal simulation surfaces what structural centrality cannot: a commercially and operationally significant failure mode that a centrality-only framework would route straight to the bottom of the remediation backlog.
+
+The broader principle is straightforward. Centrality metrics are necessary but not sufficient for infrastructure risk prioritization. They identify structural importance from graph topology alone, which makes them fast, systematic, and independent of assertion. What they cannot capture is the difference between a node that is structurally peripheral but operationally blocking and a node that is structurally central but has robust redundant paths. Blast radius simulation bridges that gap. Used together, the two approaches produce a remediation backlog that is both graph-theoretically defensible and operationally grounded -- which is the combination a CISO actually needs to take findings to a board.
+
+## Session Information
+
+```{r session-info}
+#| label: session-info
+#| echo: false
+
+sessioninfo::session_info()
+```
+
+Rendered with <a href="https://quarto.org/">Quarto</a>. Analysis performed in R using <code>igraph</code>, <code>tidygraph</code>, <code>ggraph</code>, <code>tidyverse</code>, and <code>kableExtra</code>. Centrality and blast radius pre-computed in Python (<code>compute_centrality.py</code>). Synthetic infrastructure topology generated via <code>generate_infra_data.py</code>. All nodes, services, and topologies are fictitious.
